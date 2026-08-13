@@ -12,7 +12,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -261,6 +261,8 @@ class ActiveSessionLease:
     surface: str
     enabled: bool = True
     released: bool = False
+    _registry_path: Optional[Path] = field(default=None, repr=False)
+    _registry_lock_path: Optional[Path] = field(default=None, repr=False)
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -306,7 +308,8 @@ def try_acquire_active_session(
         }
 
     state_path = _state_path()
-    with _FileLock(_lock_path()):
+    lock_path = _lock_path()
+    with _FileLock(lock_path):
         raw_entries = _read_entries(state_path)
         entries = _prune_dead(raw_entries)
         pruned = len(raw_entries) - len(entries)
@@ -331,23 +334,24 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        _registry_path=state_path,
+        _registry_lock_path=lock_path,
     ), None
 
 
 def release_active_session(lease: ActiveSessionLease) -> None:
-    state_path = _state_path()
-    try:
-        with _FileLock(_lock_path()):
-            entries = _prune_dead(_read_entries(state_path))
-            kept = [
-                entry
-                for entry in entries
-                if str(entry.get("lease_id") or "") != lease.lease_id
-            ]
-            if len(kept) != len(entries):
-                _write_entries(state_path, kept)
-    finally:
-        lease.released = True
+    state_path = lease._registry_path or _state_path()
+    lock_path = lease._registry_lock_path or _lock_path()
+    with _FileLock(lock_path):
+        entries = _prune_dead(_read_entries(state_path))
+        kept = [
+            entry
+            for entry in entries
+            if str(entry.get("lease_id") or "") != lease.lease_id
+        ]
+        if len(kept) != len(entries):
+            _write_entries(state_path, kept)
+    lease.released = True
 
 
 def transfer_active_session(
@@ -366,8 +370,9 @@ def transfer_active_session(
         lease.session_id = new_session_id
         return True
 
-    state_path = _state_path()
-    with _FileLock(_lock_path()):
+    state_path = lease._registry_path or _state_path()
+    lock_path = lease._registry_lock_path or _lock_path()
+    with _FileLock(lock_path):
         entries = _prune_dead(_read_entries(state_path))
         updated = False
         for entry in entries:

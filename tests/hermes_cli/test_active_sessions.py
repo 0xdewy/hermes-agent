@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import active_sessions
 
 
@@ -34,6 +35,82 @@ def test_resolve_max_concurrent_sessions_values(caplog):
         "Ignoring invalid max_concurrent_sessions='many'" in record.message
         for record in caplog.records
     )
+
+
+def test_lease_release_uses_registry_from_acquisition_scope(tmp_path, monkeypatch):
+    root_home = tmp_path / "root"
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(root_home))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="gateway-turn",
+        surface="gateway:teams",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert lease is not None
+    assert message is None
+    token = set_hermes_home_override(profile_home)
+    try:
+        lease.release()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert lease.released is True
+    assert active_sessions.active_session_registry_snapshot() == []
+    assert not (profile_home / "runtime" / "active_sessions.json").exists()
+
+
+def test_lease_transfer_uses_registry_from_acquisition_scope(tmp_path, monkeypatch):
+    root_home = tmp_path / "root"
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(root_home))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="before",
+        surface="gateway:teams",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert lease is not None
+    assert message is None
+    token = set_hermes_home_override(profile_home)
+    try:
+        assert active_sessions.transfer_active_session(lease, session_id="after")
+    finally:
+        reset_hermes_home_override(token)
+
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [entry["session_id"] for entry in entries] == ["after"]
+    assert not (profile_home / "runtime" / "active_sessions.json").exists()
+    lease.release()
+
+
+def test_failed_release_remains_retriable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="retry-release",
+        surface="gateway:teams",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert lease is not None
+    assert message is None
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("write failed")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(active_sessions, "_write_entries", fail_write)
+        try:
+            lease.release()
+        except OSError as exc:
+            assert str(exc) == "write failed"
+        else:
+            raise AssertionError("release should propagate the registry write failure")
+
+    assert lease.released is False
+    lease.release()
+    assert lease.released is True
+    assert active_sessions.active_session_registry_snapshot() == []
 
 
 
